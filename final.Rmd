@@ -1,0 +1,317 @@
+---
+title: "Final Markdown"
+author: "Lauren Berny"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(rio)
+library(glmnet)
+library(recipes)
+library(janitor)
+library(finalfit)
+library(cutpointr)
+library(vip)
+library(caret)
+library(ggrepel)
+library(viridis)
+
+dat <- import(here("finaldat", "generations.sav")) %>% 
+ rio::factorize()
+```
+
+# Prepare Data
+```{r}
+## transform
+dat$W1RACE <- fct_collapse(dat$W1RACE,"Other Race" = c("Asian", "Middle Eastern",
+                                "Native Hawaiian/Pacific Islander", "American Indian"))
+
+dat$W1PINC_I <- as.numeric(dat$W1PINC_I)
+
+dat$W1HINC_I <- as.numeric(dat$W1HINC_I)
+
+## select variables
+dat <- dat %>% 
+ select(STUDYID, W1WEIGHT_FULL, GEDUC1, GRUCA_I, GURBAN_I, GCENREG, 
+        W1Q71, W1RACE, W1SAMPLE, W1SEX_GENDER, W1AGE, W1SEXMINID, W1PINC_I, W1HINC_I, W1ACE_I,
+        W1AUDITC_I, W1CHILDGNC_I, W1CONNECTEDNESS_I, W1DUDIT_I, W1EVERYDAY_I, W1FELTSTIGMA_I, W1HCTHREAT_I,
+        W1IDCENTRAL_I, W1INTERNALIZED_I, W1KESSLER6_I, W1LIFESAT_I, W1MEIM_I,
+        W1SOCSUPPORT_I, W1Q71, W1Q73, W1Q74_1, W1Q74_2, W1Q74_3, W1Q74_4, W1Q74_5, W1Q74_6, W1Q74_7, 
+        W1Q74_8, W1Q74_9, W1Q74_10, W1Q74_11, W1Q74_12, W1Q74_13, W1Q74_14, W1Q74_15, W1Q74_16, W1Q74_17, W1Q74_18,
+        W1Q74_19, W1Q74_20, W1Q74_21, W1Q74_22, W1Q74_23, COHORT, W1SOCIALWB_I,
+        W1SOCSUPPORT_FAM_I,W1SOCSUPPORT_FR_I,W1SOCSUPPORT_SO_I, W1ACE_EMO_I, W1ACE_INC_I, W1ACE_IPV_I, W1ACE_MEN_I,
+        W1ACE_PHY_I, W1ACE_SEP_I, W1ACE_SEX_I, W1ACE_SUB_I)
+
+## lowercase names
+dat <- clean_names(dat)
+
+dat <- dat %>% 
+ relocate(w1kessler6_i)
+```
+
+# Examine Missingness
+There was a minimal amount of missingness, with only two variables having missing values.
+```{r}
+missing_columns <- colnames(dat)[colSums(is.na(dat)) > 0]
+
+tabyl(dat$w1q71)
+
+tabyl(dat$w1q73)
+```
+
+
+# Make Recipe
+```{r}
+factor_cols_more_than_2_levels <- names(Filter(function(x) is.factor(x) && length(levels(x)) > 2, dat))
+
+missing_columns <- colnames(dat)[colSums(is.na(dat)) > 0]
+
+blueprint <- recipe(x = dat, vars  = colnames(dat),
+                    roles = c('outcome', 'id', 'weight', rep('predictor',62))) %>%
+ step_impute_bag(all_of(missing_columns), seed_val = sample.int(10312022)) %>%
+ step_dummy(all_of(factor_cols_more_than_2_levels),one_hot=TRUE)
+
+blueprint
+
+# View(blueprint %>%
+#       prep() %>% summary)
+```
+
+
+# Training and testing, Cross-validation
+```{r}
+set.seed(10312022)
+loc <- sample(1:nrow(dat), round(nrow(dat) * 0.8))
+df_tr  <- dat[loc, ]
+df_te  <- dat[-loc, ]
+
+df_tr = df_tr[sample(nrow(df_tr)),]
+# Create 10 folds with equal size
+folds = cut(seq(1,nrow(df_tr)),breaks=10,labels=FALSE)
+# Create the list for each fold 
+my.indices <- vector('list',10)
+for(i in 1:10){
+my.indices[[i]] <- which(folds!=i)
+}
+
+cv <- trainControl(method = "cv",
+                   index  = my.indices)
+
+caret_mod <- train(blueprint, 
+                   data      = df_tr, 
+                   method    = "lm", 
+                   trControl = cv)
+
+predicted_te <- predict(caret_mod, df_te)
+rmse_te <- sqrt(mean((df_te$w1kessler6_i - predicted_te)^2))
+rsq_te <- cor(df_te$w1kessler6_i,predicted_te)^2
+mae_te <- mean(abs(df_te$w1kessler6_i - predicted_te))
+```
+
+# Ridge Regression
+```{r warning=FALSE, message=FALSE}
+grid <- data.frame(alpha = 0, lambda = c(seq(0,2,.001)))
+
+# Train the model
+ridge <- train(blueprint, 
+               data      = df_tr, 
+               method    = "glmnet", 
+               trControl = cv,
+               tuneGrid  = grid)
+ridge$bestTune
+plot(ridge)
+
+predicted_te <- predict(ridge, df_te)
+
+rmse_ridge <- sqrt(mean((df_te$w1kessler6_i - predicted_te)^2))
+rmse_ridge
+rsq_ridge <- cor(df_te$w1kessler6_i,predicted_te)^2
+rsq_ridge
+mae_ridge <- mean(abs(df_te$w1kessler6_i - predicted_te))
+mae_ridge
+```
+# Lasso Regression
+```{r warning=FALSE, message=FALSE}
+grid <- data.frame(alpha = 1, lambda = c(seq(0,2,.001)))
+
+lasso <- train(blueprint, 
+               data      = df_tr, 
+               method    = "glmnet", 
+               trControl = cv,
+               tuneGrid  = grid)
+lasso$results
+lasso$bestTune
+plot(lasso)
+
+predicted_te <- predict(lasso, df_te)
+
+rmse_lasso <- sqrt(mean((df_te$w1kessler6_i - predicted_te)^2))
+rmse_lasso
+rsq_lasso <- cor(df_te$w1kessler6_i,predicted_te)^2
+rsq_lasso
+mae_lasso <- mean(abs(df_te$w1kessler6_i - predicted_te))
+mae_lasso
+```
+
+# Random Forest Model
+## Tuning 
+
+```{r}
+ctrl <- trainControl(method = "cv",
+                     index  = my.indices)
+
+# Define the grid of values for mtry and num.trees
+mtry_values <- c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60)
+num_trees <- c(100, 250, 500, 750, 1000)
+
+
+num_combinations <- length(mtry_values) * length(num_trees)
+results_matrix <- matrix(NA, nrow = num_combinations, ncol = 3,
+                         dimnames = list(NULL, c("mtry", "num.trees", "RMSE")))
+
+index <- 1
+
+for (i in seq_along(mtry_values)) {
+  for (j in seq_along(num_trees)) {
+    grid <- expand.grid(
+      mtry = mtry_values[i],
+      splitrule = 'variance',
+      min.node.size = 2
+    )
+    
+    rforest <- train(
+      blueprint,
+      data = df_tr,
+      method = 'ranger',
+      trControl = ctrl,
+      tuneGrid = grid,
+      num.trees = num_trees[j],
+      replace = TRUE,
+      sample.fraction = 0.8,
+      max.depth = 10,
+      importance = 'impurity'
+    )
+    
+    results_matrix[index, 1] <- mtry_values[i]
+    results_matrix[index, 2] <- num_trees[j]
+    results_matrix[index, 3] <- rforest$results$RMSE
+    
+    index <- index + 1
+  }
+}
+
+# Find the row index with the minimum RMSE
+min_rmse_row <- which.min(results_matrix[, "RMSE"])
+
+# Get the values (mtry, num.trees, RMSE, MAE, R-squared) for the row with the lowest RMSE
+best_model_values <- results_matrix[min_rmse_row, ]
+
+print(best_model_values)
+```
+
+
+## Tuned Model
+Estimated best model to extract importance
+```{r}
+grid <- expand.grid(
+  mtry = 30,
+  splitrule = 'variance',
+  min.node.size = 2)
+
+ctrl <- trainControl(method = "cv", index  = my.indices)
+
+rforest <- train(blueprint,
+      data = df_tr,
+      method = 'ranger',
+      trControl = ctrl,
+      tuneGrid = grid,
+      num.trees = 250,
+      replace = TRUE,
+      sample.fraction = 0.8,
+      max.depth = 10,
+      importance = 'impurity')
+
+predicted_te <- predict(rforest, df_te)
+
+rmse_rf <- sqrt(mean((df_te$w1kessler6_i - predicted_te)^2))
+rmse_rf
+rsq_rf <- cor(df_te$w1kessler6_i,predicted_te)^2
+rsq_rf
+mae_rf <- mean(abs(df_te$w1kessler6_i - predicted_te))
+mae_rf
+```
+# Model Evaluation
+```{r}
+Model <- c('Linear Regression', 
+           'Ridge Regression', 
+           'Lasso Regression',
+           'Bagged Random Forest')
+
+RMSE <- c(rmse_te, rmse_ridge, rmse_lasso, rmse_rf)
+Rsquared <- c(rsq_te, rsq_ridge, rsq_lasso, rsq_rf)
+MAE <- c(mae_te, mae_ridge, mae_lasso, mae_rf)
+
+tab <- data.frame(Model, RMSE, Rsquared, MAE )
+tab
+
+tab <- tab %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value")
+
+tab %>% 
+ ggplot(aes(x = Model, y = Value, color = Metric, shape = Metric, label =
+             round(Value,3))) + 
+ scale_color_manual(values = c("#481f70ff", "#31688eff", "#47c16eff")) +
+ geom_point(size=3) +
+ geom_text(vjust=-1.2, show.legend = F, size = 3) +
+ labs(title = "Fit Metric Comparison") +
+ ylim(0,4) +
+ theme_bw() +
+ theme(legend.position = "bottom")
+```
+
+# Variable Importance
+```{r}
+imp <- as.data.frame(importance(rforest$finalModel))
+
+# Set row names as a variable in the dataframe
+imp <- imp %>%
+  tibble::rownames_to_column(var = "Variable")
+
+# Remove the previous row names
+rownames(imp) <- NULL  # Removes row names from the dataframe
+
+# Sort the dataframe by a specific variable (e.g., 'mpg' in ascending order)
+imp <- imp %>% 
+ mutate(Importance = `importance(rforest$finalModel)`) %>% 
+ select(-`importance(rforest$finalModel)`) %>% 
+ arrange(desc(Importance))
+
+labs <- c("Health Outcome", "Positive Health", "Positive Health", "Stressor", "Demographic",
+          "Demographic", "Demographic", "Social Support", "Stressor", "Demographic",
+          "Health Outcome", "Identity", "Identity", "Social Support", "Identity",
+          "Social Support", "Health Outcome", "Social Support", "Stressor", "Health Outcome",
+          rep(NA, 59))
+
+imp <- imp %>% 
+ mutate(Category = labs)
+
+imp %>% 
+ head(20) %>%
+ ggplot(aes(x = Importance, y = reorder(Variable, Importance), color = Category)) +
+  geom_segment(aes(yend = Variable), xend = 0, colour = "grey50") +
+ scale_colour_viridis_d(option = "inferno") +
+  geom_point(size = 3.5) +  # Use a larger dot
+ labs(x = "Impurity", y = "Variable Name",
+      title = "Predictor Importance in Bagged Random Forest Model") +
+  theme_bw() +
+ theme(legend.position = "bottom",
+       legend.title=element_blank())
+
+```
+
